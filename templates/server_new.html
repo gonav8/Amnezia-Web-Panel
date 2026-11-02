@@ -77,6 +77,13 @@
                         <div class="form-hint">{{ _('enroll_key_hint') }}</div>
                     </div>
                 </div>
+
+                <div class="form-group enroll-grid__full">
+                    <label class="form-label" for="enrollSudoPassword">Sudo password (optional)</label>
+                    <input class="form-input" type="password" id="enrollSudoPassword"
+                        autocomplete="new-password" autocapitalize="none" spellcheck="false">
+                    <div class="form-hint">Used for sudo operations. Leave blank only if this user is root or has passwordless sudo.</div>
+                </div>
             </div>
 
             <div class="enroll-alert" id="enrollError" role="alert" hidden></div>
@@ -172,6 +179,7 @@
             username: enrollEl('enrollUser').value.trim(),
             password: enrollEl('enrollPassword').value,
             private_key: enrollEl('enrollKey').value,
+            sudo_password: enrollEl('enrollSudoPassword').value,
         };
     }
 
@@ -184,6 +192,7 @@
             username: form.username,
             password: enrollState.authMethod === 'password' ? form.password : '',
             private_key: enrollState.authMethod === 'key' ? form.private_key : '',
+            sudo_password: form.sudo_password,
         };
     }
 
@@ -560,6 +569,7 @@
     function enrollClearCredentials() {
         enrollEl('enrollPassword').value = '';
         enrollEl('enrollKey').value = '';
+        enrollEl('enrollSudoPassword').value = '';
     }
 
     function enrollFormSubmit(event) {
@@ -570,7 +580,7 @@
     }
 
     ['enrollName', 'enrollHost', 'enrollPort', 'enrollUser',
-        'enrollPassword', 'enrollKey'].forEach(id => {
+        'enrollPassword', 'enrollKey', 'enrollSudoPassword'].forEach(id => {
         const field = enrollEl(id);
         if (!field) return;
         field.addEventListener('input', () => invalidateTest());

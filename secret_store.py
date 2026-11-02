@@ -1,4 +1,4 @@
-"""Authenticated encryption for panel-held SSH and authenticator secrets.
+"""Authenticated encryption for panel-held SSH, sudo, and authenticator secrets.
 
 The 256-bit key must be provisioned outside the panel state volume and mounted
 read-only at SSH_CREDENTIALS_KEY_FILE (default: /run/secrets/ssh-credentials-key).
@@ -91,14 +91,14 @@ def decrypt_secret(value: Any, *, context: str) -> Any:
 
 
 def seal_panel_state(data: dict) -> dict:
-    """Return a copy of state with plaintext SSH/TOTP secrets sealed for disk."""
+    """Return a copy of state with plaintext SSH/sudo/TOTP secrets sealed for disk."""
     import copy
 
     stored = copy.deepcopy(data)
     for server in stored.get("servers", []):
         if not isinstance(server, dict):
             continue
-        for field in ("password", "private_key"):
+        for field in ("password", "private_key", "sudo_password"):
             value = server.get(field, "")
             if value and not is_envelope(value):
                 server[field] = encrypt_secret(value, context=f"prvtpro:ssh:{field}:v1")
@@ -121,7 +121,7 @@ def unseal_panel_state(data: dict) -> dict:
     for server in data.get("servers", []):
         if not isinstance(server, dict):
             continue
-        for field in ("password", "private_key"):
+        for field in ("password", "private_key", "sudo_password"):
             if is_envelope(server.get(field)):
                 server[field] = decrypt_secret(
                     server[field], context=f"prvtpro:ssh:{field}:v1")
@@ -141,7 +141,7 @@ def has_legacy_plaintext_secrets(data: dict) -> bool:
     for server in data.get("servers", []):
         if isinstance(server, dict) and any(
             isinstance(server.get(field), str) and server.get(field)
-            for field in ("password", "private_key")
+            for field in ("password", "private_key", "sudo_password")
         ):
             return True
     for user in data.get("users", []):

@@ -64,7 +64,7 @@ class InventoryBrowserTests(unittest.TestCase):
                 page = browser.new_page()
                 page.set_content('''<div id="grid"><div class="server-card" id="server-1" data-idx="1" data-uid="b"></div><div class="server-card" id="server-0" data-idx="0" data-uid="a"></div></div>
                     <form id="editServerForm" data-server-uid="a"></form>
-                    <input id="editServerIdx" value="0"><input id="editServerName" value="renamed"><input id="editServerHost" value="a.example.test"><input id="editServerPort" value="22"><input id="editServerUser" value="fixture"><input id="editServerPassword"><input id="editServerKey"><input id="editServerSelfService" type="checkbox">
+                    <input id="editServerIdx" value="0"><input id="editServerName" value="renamed"><input id="editServerHost" value="a.example.test"><input id="editServerPort" value="22"><input id="editServerUser" value="fixture"><input id="editServerPassword"><input id="editServerKey"><input id="editServerSudoPassword"><input id="editServerSelfService" type="checkbox">
                     <button id="editServerBtn"></button><span id="editServerBtnText"></span><span id="editServerSpinner"></span>''')
                 page.add_script_tag(content="""
 const calls = [];

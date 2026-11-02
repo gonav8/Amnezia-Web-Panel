@@ -67,10 +67,11 @@ class SecretStoreTests(unittest.TestCase):
         with self.assertRaises(SecretStorageError):
             encrypt_secret('secret', context='test')
 
-    def test_panel_state_seals_ssh_and_totp_but_preserves_other_data(self):
+    def test_panel_state_seals_ssh_sudo_and_totp_but_preserves_other_data(self):
         original = {
             'servers': [{'uid': 'server-1', 'password': 'ssh-pass',
-                         'private_key': '-----BEGIN PRIVATE KEY-----', 'host': 'host'}],
+                         'private_key': '-----BEGIN PRIVATE KEY-----',
+                         'sudo_password': 'sudo-pass', 'host': 'host'}],
             'users': [{'id': 'user-1', 'mfa': {'totp_secret': 'BASE32SECRET',
                                                 'recovery_code_hashes': ['hash']}}],
             'settings': {'title': 'panel'},
@@ -79,16 +80,19 @@ class SecretStoreTests(unittest.TestCase):
         self.assertEqual(original['servers'][0]['password'], 'ssh-pass')
         self.assertTrue(is_envelope(sealed['servers'][0]['password']))
         self.assertTrue(is_envelope(sealed['servers'][0]['private_key']))
+        self.assertTrue(is_envelope(sealed['servers'][0]['sudo_password']))
         self.assertTrue(is_envelope(sealed['users'][0]['mfa']['totp_secret']))
         serialized = str(sealed)
         self.assertNotIn('ssh-pass', serialized)
         self.assertNotIn('PRIVATE KEY', serialized)
+        self.assertNotIn('sudo-pass', serialized)
         self.assertNotIn('BASE32SECRET', serialized)
         unsealed = unseal_panel_state(sealed)
         self.assertEqual(unsealed, original)
 
     def test_legacy_plaintext_is_detected_and_empty_fields_need_no_key(self):
-        state = {'servers': [{'password': 'legacy', 'private_key': ''}], 'users': []}
+        state = {'servers': [{'password': 'legacy', 'private_key': '',
+                              'sudo_password': 'legacy-sudo'}], 'users': []}
         self.assertTrue(has_legacy_plaintext_secrets(state))
         self.assertFalse(has_legacy_plaintext_secrets({'servers': [{'password': ''}], 'users': []}))
         self.assertEqual(encrypt_secret('', context='empty'), '')
@@ -138,11 +142,15 @@ class SecretStoreTests(unittest.TestCase):
         try:
             panel.save_data({'servers': [{'uid': 'server-2', 'host': 'vpn.example',
                                           'username': 'root', 'password': 'ssh-secret',
-                                          'private_key': ''}], 'users': []})
+                                          'private_key': '',
+                                          'sudo_password': 'sudo-secret'}], 'users': []})
             raw = Path(panel.DATA_FILE).read_text(encoding='utf-8')
             self.assertNotIn('ssh-secret', raw)
+            self.assertNotIn('sudo-secret', raw)
             self.assertTrue(is_envelope(json.loads(raw)['servers'][0]['password']))
+            self.assertTrue(is_envelope(json.loads(raw)['servers'][0]['sudo_password']))
             self.assertEqual(panel.load_data()['servers'][0]['password'], 'ssh-secret')
+            self.assertEqual(panel.load_data()['servers'][0]['sudo_password'], 'sudo-secret')
         finally:
             panel.DATA_FILE = original_path
 

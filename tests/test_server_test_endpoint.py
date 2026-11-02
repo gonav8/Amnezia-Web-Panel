@@ -92,7 +92,7 @@ class ServerTestEndpointTests(PanelTestBase, unittest.TestCase):
         inspect.assert_called_once()
         enroll.assert_called_once()
         manager.assert_called_once_with('192.0.2.10', 2222, 'root',
-                                        'synthetic-password', '')
+                                        'synthetic-password', '', sudo_password=None)
         ssh.connect.assert_called_once()
         ssh.disconnect.assert_called_once()
         with open(panel.DATA_FILE, encoding='utf-8') as f:
@@ -130,6 +130,24 @@ class ServerTestEndpointTests(PanelTestBase, unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()['host_key']['status'], 'trusted')
         enroll.assert_not_called()
+        ssh.connect.assert_called_once()
+
+    def test_private_key_auth_accepts_a_distinct_sudo_password(self):
+        body = self.payload()
+        body.update(password='', private_key='synthetic-private-key',
+                    sudo_password='synthetic-sudo-password')
+        with TestClient(panel.app) as client:
+            self.login(client, 'admin')
+            ssh = self.fake_ssh()
+            with mock.patch.object(panel.ssh_trust, 'inspect',
+                                   return_value=self.inspection('trusted')), \
+                    mock.patch.object(panel, 'SSHManager', return_value=ssh) as manager:
+                response = client.post('/api/servers/test', json=body)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        manager.assert_called_once_with('192.0.2.10', 2222, 'root', '',
+                                        'synthetic-private-key',
+                                        sudo_password='synthetic-sudo-password')
         ssh.connect.assert_called_once()
 
     def test_authentication_failure_is_classified(self):

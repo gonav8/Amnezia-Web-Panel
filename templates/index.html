@@ -262,6 +262,14 @@
                 </div>
             </div>
 
+            <div class="form-group">
+                <label class="form-label" for="editServerSudoPassword">Sudo password (optional)</label>
+                <input class="form-input" type="password" id="editServerSudoPassword"
+                    autocomplete="new-password" autocapitalize="none" spellcheck="false"
+                    placeholder="Leave blank to keep the current value">
+                <div class="form-hint">For privileged server operations; stored separately from SSH authentication and encrypted at rest.</div>
+            </div>
+
             <div class="form-group" style="margin-top: var(--space-md); padding-top: var(--space-md); border-top: 1px solid var(--border-color);">
                 <label class="form-label">
                     <input type="checkbox" id="editServerSelfService">
@@ -466,6 +474,7 @@
         document.getElementById('editServerUser').value = card.dataset.username || '';
         document.getElementById('editServerPassword').value = '';
         document.getElementById('editServerKey').value = '';
+        document.getElementById('editServerSudoPassword').value = '';
 
         // Pre-select the tab matching the server's current auth method.
         const authIsKey = card.dataset.auth === 'key';
@@ -498,6 +507,7 @@
                 // Empty -> null means "leave unchanged" on the backend.
                 password: document.getElementById('editServerPassword').value || null,
                 private_key: document.getElementById('editServerKey').value || null,
+                sudo_password: document.getElementById('editServerSudoPassword').value || null,
                 self_service_enabled: document.getElementById('editServerSelfService').checked,
             };
             const uid = document.getElementById('editServerForm').dataset.serverUid || '';

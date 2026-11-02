@@ -25,12 +25,13 @@ class SSHManager:
     """Manages SSH connections and command execution on remote servers."""
 
     def __init__(self, host, port, username, password=None, private_key=None,
-                 connect_cooldown_base=30.0):
+                 connect_cooldown_base=30.0, sudo_password=None):
         self.host = host
         self.port = int(port)
         self.username = username
         self.password = password
         self.private_key = private_key
+        self.sudo_password = sudo_password
         self.client = None
         self._is_root = (username == 'root')
         # Serializes connect/disconnect so concurrent threads (UI request
@@ -354,13 +355,14 @@ class SSHManager:
         if self._is_root:
             return self.run_command(clean_cmd, timeout=timeout)
 
-        if self.password:
+        sudo_password = getattr(self, 'sudo_password', None) or self.password
+        if sudo_password:
             # Feed the password via channel stdin: keeping it out of the
             # command line hides it from both the panel log (logged above)
             # and the remote process list.
             return self.run_command(
                 f"sudo -S -p '' {clean_cmd}", timeout=timeout,
-                stdin_input=self.password + '\n')
+                stdin_input=sudo_password + '\n')
 
         return self.run_command(f"sudo {clean_cmd}", timeout=timeout)
 

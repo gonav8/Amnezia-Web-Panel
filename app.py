@@ -460,6 +460,7 @@ def get_ssh(server):
                 username=server['username'],
                 password=server.get('password'),
                 private_key=server.get('private_key'),
+                sudo_password=server.get('sudo_password'),
                 connect_cooldown_base=cooldown_base,
             )
             _SSH_POOL[key] = ssh
@@ -2410,6 +2411,7 @@ class AddServerRequest(BaseModel):
     username: str = ''
     password: str = ''
     private_key: str = ''
+    sudo_password: str = ''
     name: str = ''
 
 
@@ -2419,10 +2421,11 @@ class EditServerRequest(BaseModel):
     ssh_port: Optional[conint(strict=True, ge=1, le=65535)] = None
     username: str = ''
     # Optional[str] = None lets the client distinguish "leave field as is"
-    # (omit / null) from "explicitly clear" (empty string). Both credential
-    # fields can be omitted to keep current auth unchanged.
+    # (omit / null) from "explicitly clear" (empty string). SSH auth fields
+    # can be omitted to keep current auth unchanged.
     password: Optional[str] = None
     private_key: Optional[str] = None
+    sudo_password: Optional[str] = None
     self_service_enabled: Optional[bool] = None
 
 
@@ -4221,7 +4224,8 @@ async def api_test_server(request: Request, req: AddServerRequest):
                              'error_code': error_code}, status_code=400)
 
     def verify():
-        ssh = SSHManager(host, req.ssh_port, username, req.password, req.private_key)
+        ssh = SSHManager(host, req.ssh_port, username, req.password, req.private_key,
+                         sudo_password=req.sudo_password or None)
         try:
             ssh.connect()
             return ssh.test_connection()
@@ -4272,7 +4276,8 @@ async def api_add_server(request: Request, req: AddServerRequest):
                                  'error_code': 'validation_error'}, status_code=400)
 
         def verify():
-            ssh = SSHManager(host, req.ssh_port, username, req.password, req.private_key)
+            ssh = SSHManager(host, req.ssh_port, username, req.password, req.private_key,
+                             sudo_password=req.sudo_password or None)
             try:
                 ssh.connect()
                 return ssh.test_connection()
@@ -4293,7 +4298,8 @@ async def api_add_server(request: Request, req: AddServerRequest):
             'uid': uuid.uuid4().hex,
             'name': name, 'host': host, 'ssh_port': req.ssh_port,
             'username': username, 'password': req.password,
-            'private_key': req.private_key, 'server_info': server_info,
+            'private_key': req.private_key, 'sudo_password': req.sudo_password,
+            'server_info': server_info,
             'protocols': {},
         }
         async with SERVER_MUTATION_LOCK:
@@ -4332,6 +4338,8 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
                 new_user = (req.username or '').strip() or server['username']
                 new_port = int(req.ssh_port or server.get('ssh_port', 22))
                 new_name = (req.name or '').strip() or server.get('name') or new_host
+                new_sudo_password = (server.get('sudo_password', '')
+                                     if req.sudo_password is None else req.sudo_password)
                 if req.private_key:
                     new_pass, new_key = '', req.private_key
                 elif req.password:
@@ -4342,7 +4350,8 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
                     return JSONResponse({'error': 'Password or SSH key is required'}, status_code=400)
 
                 def verify():
-                    ssh = SSHManager(new_host, new_port, new_user, new_pass, new_key)
+                    ssh = SSHManager(new_host, new_port, new_user, new_pass, new_key,
+                                     sudo_password=new_sudo_password or None)
                     try:
                         ssh.connect()
                         return ssh.test_connection()
@@ -4357,11 +4366,12 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
                     data = load_data()
                     _, current = find_server_by_uid(data, uid)
                     if current is None or any(current.get(k) != server.get(k) for k in
-                                              ('host', 'ssh_port', 'username', 'password', 'private_key')):
+                                              ('host', 'ssh_port', 'username', 'password',
+                                               'private_key', 'sudo_password')):
                         return JSONResponse({'error': 'Server changed during verification'}, status_code=409)
                     current.update(name=new_name, host=new_host, ssh_port=new_port,
                                    username=new_user, password=new_pass, private_key=new_key,
-                                   server_info=server_info)
+                                   sudo_password=new_sudo_password, server_info=server_info)
                     if req.self_service_enabled is not None:
                         current['self_service_enabled'] = bool(req.self_service_enabled)
                     save_data(data)

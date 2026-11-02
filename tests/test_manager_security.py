@@ -41,6 +41,29 @@ class ManagerSecurityTests(unittest.TestCase):
             line = next(line for line in script.splitlines() if line.startswith(name + '='))
             self.assertEqual(shlex.split(line), [name + "=telemt'; id #"])
 
+    def test_private_key_auth_uses_separate_sudo_password_over_stdin(self):
+        ssh = SSHManager('example.test', 22, 'ian',
+                         private_key='test-key', sudo_password='sudo-secret')
+        ssh.run_command = Mock(return_value=('', '', 0))
+
+        ssh.run_sudo_command('apt-get install -y example')
+
+        self.assertEqual(ssh.password, None)
+        self.assertEqual(ssh.private_key, 'test-key')
+        ssh.run_command.assert_called_once_with(
+            "sudo -S -p '' apt-get install -y example", timeout=60,
+            stdin_input='sudo-secret\n')
+
+    def test_password_auth_remains_sudo_fallback_when_no_override(self):
+        ssh = SSHManager('example.test', 22, 'ian', password='ssh-and-sudo-secret')
+        ssh.run_command = Mock(return_value=('', '', 0))
+
+        ssh.run_sudo_command('true')
+
+        ssh.run_command.assert_called_once_with(
+            "sudo -S -p '' true", timeout=60,
+            stdin_input='ssh-and-sudo-secret\n')
+
     def make_ssh(self):
         ssh = SSHManager('example.test', 22, 'admin', password='secret')
         ssh.ensure_connected = Mock()

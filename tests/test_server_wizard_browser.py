@@ -210,6 +210,7 @@ class CompactEnrollmentBrowserTests(unittest.TestCase):
         self.assertEqual(test_calls[0]['body'], {
             'name': '', 'host': 'node.example.test', 'ssh_port': 2222,
             'username': 'root', 'password': 'synthetic-password', 'private_key': '',
+            'sudo_password': '',
         })
         self.assertFalse(page.locator('#enrollAddBtn').is_disabled())
         self.assertIn('SHA256:trusted', page.locator('#enrollSuccessText').text_content())
@@ -230,7 +231,7 @@ class CompactEnrollmentBrowserTests(unittest.TestCase):
         self.assertNotIn('localStorage', self.wizard_js)
         self.assertNotIn('sessionStorage', self.wizard_js)
 
-    def test_private_key_tab_sends_only_the_key(self):
+    def test_private_key_tab_sends_key_and_separate_sudo_password(self):
         page = self.new_page()
         self.configure_outcomes(page, self.success_outcome())
         self.click(page, '#enrollKeyTab')
@@ -241,12 +242,21 @@ class CompactEnrollmentBrowserTests(unittest.TestCase):
         page.fill('#enrollPort', '2222')
         page.fill('#enrollUser', 'root')
         page.fill('#enrollKey', '-----BEGIN OPENSSH PRIVATE KEY-----\nsynthetic\n-----END OPENSSH PRIVATE KEY-----')
+        page.fill('#enrollSudoPassword', 'synthetic-sudo-password')
         self.click(page, '#enrollTestBtn')
         page.wait_for_function("document.getElementById('enrollSuccess').hidden === false")
 
         body = self.calls(page, TEST)[0]['body']
         self.assertEqual(body['password'], '')
         self.assertIn('synthetic', body['private_key'])
+        self.assertEqual(body['sudo_password'], 'synthetic-sudo-password')
+
+        self.click(page, '#enrollAddBtn')
+        page.wait_for_function('window.__serverHref !== undefined')
+        add_body = self.calls(page, ADD)[0]['body']
+        self.assertEqual(add_body['password'], '')
+        self.assertIn('synthetic', add_body['private_key'])
+        self.assertEqual(add_body['sudo_password'], 'synthetic-sudo-password')
 
     def test_changed_key_blocks_add_until_explicitly_accepted(self):
         page = self.new_page()
