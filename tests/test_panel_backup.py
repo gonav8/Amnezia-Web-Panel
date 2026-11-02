@@ -26,6 +26,7 @@ import panel_backup as backup
 import peer_lifecycle_lock as lifecycle
 import peer_recovery as recovery
 from scripts.panel_recovery import complete_restore, FINISH_CONFIRM
+from secret_store import decode_recovery_snapshot, is_envelope, unseal_panel_state
 
 
 def fixture():
@@ -305,14 +306,23 @@ class RestoreTests(StateFixture, unittest.TestCase):
     def test_complete_staging_preserves_accounting_and_all_evidence(self):
         archive = self.archive(); target = self.root / 'restored'
         result = backup.stage_restore(archive, target, backup.STAGE_CONFIRM)
-        data = json.loads((target / 'state/data.json').read_text())
+        state_path = target / 'state/data.json'
+        raw_state = json.loads(state_path.read_text())
+        self.assertTrue(is_envelope(raw_state['servers'][0]['password']))
+        self.assertNotIn(b'synthetic-sensitive-password', state_path.read_bytes())
+        data = unseal_panel_state(raw_state)
         self.assertTrue(result['startup_held'])
         self.assertEqual(data[recovery.DISASTER_HOLD], result['restore_id'])
         for key in self.original:
             self.assertEqual(data[key], self.original[key])
         self.assertEqual((target / 'state/data.json.peer-creates.json').read_bytes(), self.journal.read_bytes())
         self.assertEqual((target / 'state/data.json.lifecycle-uncertain.json').read_bytes(), self.fence.read_bytes())
-        self.assertEqual((target / 'state/data.json.recovery' / self.record.name).read_bytes(), self.record.read_bytes())
+        staged_record = json.loads((target / 'state/data.json.recovery' / self.record.name).read_text())
+        original_record = json.loads(self.record.read_text())
+        self.assertTrue(is_envelope(staged_record['before_base64']))
+        self.assertEqual(staged_record['phase'], original_record['phase'])
+        self.assertEqual(decode_recovery_snapshot(staged_record, self.record.stem),
+                         decode_recovery_snapshot(original_record, self.record.stem))
         self.assertEqual((target / 'trust/ssh_known_hosts').read_bytes(), self.trust.read_bytes())
         self.assertEqual(self.data.read_text(), json.dumps(self.original))
         self.assertFalse((target / 'state/data.json.runtime.lock').exists())
@@ -327,9 +337,13 @@ class RestoreTests(StateFixture, unittest.TestCase):
         done = complete_restore(path, result['restore_id'], 'e' * 32, recovery.file_hash(raw), FINISH_CONFIRM)
         self.assertEqual(done['status'], 'success')
         self.assertFalse(done['counters_verified_final'])
-        self.assertNotIn(recovery.DISASTER_HOLD, json.loads(path.read_bytes()))
+        raw_state = json.loads(path.read_bytes())
+        self.assertTrue(is_envelope(raw_state['servers'][0]['password']))
+        self.assertNotIn(b'synthetic-sensitive-password', path.read_bytes())
+        state = unseal_panel_state(raw_state)
+        self.assertNotIn(recovery.DISASTER_HOLD, state)
         for key in self.original:
-            self.assertEqual(json.loads(path.read_bytes())[key], self.original[key])
+            self.assertEqual(state[key], self.original[key])
 
     def test_existing_destination_and_retry_never_overwrite_newer_state(self):
         archive = self.archive(); target = self.root / 'restored'
@@ -553,7 +567,8 @@ class CancellationTests(StateFixture, unittest.IsolatedAsyncioTestCase):
         self.stack.enter_context(patch.object(panel, 'DATA_FILE', str(self.data)))
         self.stack.enter_context(patch.object(panel, 'DATA_LOCK', self.lock))
         self.stack.enter_context(patch.object(panel, '_ssh_trust_admin', return_value=True))
-        self.stack.enter_context(patch.object(panel, 'get_current_user', return_value={'id': 'admin'}))
+        self.stack.enter_context(patch.object(panel, 'get_current_user',
+                                              return_value={'id': 'admin', 'role': 'admin', 'enabled': True}))
         self.stack.enter_context(patch.dict(os.environ, {'SSH_KNOWN_HOSTS_FILE': str(self.trust)}))
         original = os.path.expanduser
         self.stack.enter_context(patch.object(os.path, 'expanduser', side_effect=lambda p: str(self.system) if p == '~/.ssh/known_hosts' else original(p)))

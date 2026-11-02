@@ -17,6 +17,7 @@
     <link rel="stylesheet" href="/static/css/style.css?v={{ static_v }}">
     <script>!function () { var t = localStorage.getItem('theme') || 'dark'; document.documentElement.setAttribute('data-theme', t); var m = document.querySelector('meta[name=theme-color]'); if (m) m.content = t === 'light' ? '#f5f5f7' : '#0a0a0f'; }()</script>
     <script src="/static/js/qrcode.min.js"></script>
+    <script src="/static/js/mfa-step-up.js" defer></script>
     <script src="/static/js/searchable-select.js" defer></script>
     {% block head_extra %}{% endblock %}
     <style>
@@ -56,6 +57,7 @@
                 {% endif %}
                 {% if current_user.role == 'admin' %}
                 <a href="/settings" class="nav-link">{{ _('nav_settings') }}</a>
+                <a href="/security" class="nav-link">Security</a>
                 {% endif %}
                 <a href="/my" class="nav-link">{{ _('nav_connections') }}</a>
             </nav>

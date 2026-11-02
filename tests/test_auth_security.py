@@ -27,6 +27,7 @@ def isolated_panel():
         'Request': object, 'ConnectionActionRequest': object,
         'JSONResponse': JSONResponse, 'hashlib': hashlib,
         'logger': Mock(), 'get_ssh': Mock(), 'get_protocol_manager': Mock(),
+        'admin_mfa_required': Mock(return_value=False),
         '_manager_call': Mock(return_value='owned config'),
         'protocol_public_endpoint': Mock(return_value=('example.invalid', None)),
         'config_payloads': Mock(return_value={}),

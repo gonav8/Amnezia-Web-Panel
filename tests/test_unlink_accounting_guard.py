@@ -68,6 +68,7 @@ class UnlinkAccountingGuard(unittest.IsolatedAsyncioTestCase):
             DATA_FILE=str(self.file), DATA_LOCK=asyncio.Lock(),
             DEFAULT_MAIL_SETTINGS={}, DEFAULT_SELF_SERVICE_SETTINGS={},
             Request=object, UnlinkConnectionRequest=object,
+            unseal_panel_state=lambda data: data, seal_panel_state=lambda data: data,
             JSONResponse=JSONResponse, _check_admin=lambda request: request.admin,
             get_current_user=lambda request: {'id': 'admin-1'},
             get_ssh=get_ssh, get_protocol_manager=get_protocol_manager,

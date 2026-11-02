@@ -220,6 +220,11 @@ response; the standard user-connection dialog retains it until success.
 > [!IMPORTANT]  
 > Secure your panel by changing the default password in the **Users** section immediately after first login.
 
+Administrator sign-in also requires a second factor. On the first admin login,
+enroll a passkey or authenticator-app TOTP and save the one-time recovery codes.
+Passkeys require the panel to be opened from a browser-trusted HTTPS origin;
+TOTP remains available when HTTPS/WebAuthn has not yet been configured.
+
 ## 🧰 Environment Variables
 
 Every variable is optional — the panel starts with working defaults. Paths marked `<app dir>` resolve
@@ -229,6 +234,10 @@ next to `app.py`, or next to the executable in the standalone builds from *Insta
 | --- | --- | --- |
 | `SECRET_KEY` | random on each start | Key used to sign session cookies. Without it a fresh key is generated at every start, which logs all admins out on restart — set a long random value in production. |
 | `DATA_FILE` | `<app dir>/data.json` | Path to the JSON state file (servers, users, API tokens, settings). `~` is expanded and missing parent directories are created on first save. |
+| `SSH_CREDENTIALS_KEY_FILE` | `/run/secrets/ssh-credentials-key` | Read-only 32-byte AES-GCM master key used to encrypt SSH passwords/private keys and TOTP secrets in JSON state. Keep it separate from `DATA_FILE` and every panel backup. |
+| `PANEL_ADMIN_MFA_REQUIRED` | `1` | Require MFA for administrator login. Keep enabled in production; `0` exists only for controlled tests/legacy migrations. |
+| `WEBAUTHN_RP_ID` | unset | DNS name used as the WebAuthn relying-party ID, e.g. `panel.example.com` (no scheme or path). |
+| `WEBAUTHN_ORIGIN` | unset | Exact browser origin for passkeys, e.g. `https://panel.example.com:5001` (scheme/host/optional port only). HTTPS is required except localhost. |
 | `TUNNEL_STATE_FILE` | `<app dir>/tunnels_state.json` | Path where Cloudflare/ngrok tunnel runtime state (PID, public URL) is persisted between restarts. |
 | `TUNNEL_BIN_DIR` | `<app dir>/bin` | Directory holding the panel-managed `cloudflared` / `ngrok` binaries downloaded from the **Settings** page. |
 | `AWG_IPV6` | `auto` | Dual-stack policy for AWG tunnels: `auto` probes the host and the protocol container, `off` keeps every tunnel IPv4-only, `on` forces dual-stack. |
@@ -236,6 +245,21 @@ next to `app.py`, or next to the executable in the standalone builds from *Insta
 Two things that are deliberately *not* environment variables: the port the panel listens on and its SSL
 certificates, both configured in **Settings → SSL** and stored in the state file. For ngrok, the authtoken
 comes from **Settings** as well and overrides an inherited `NGROK_AUTHTOKEN`.
+
+Before starting the bundled Compose service, provision the encryption key once:
+
+```bash
+./scripts/init_ssh_credentials_key.sh
+docker compose up -d
+```
+
+The generated `secrets/ssh-credentials.key` is excluded from Git, mounted
+read-only inside the container, and omitted from downloadable backups. Preserve
+an independent protected copy: encrypted state/backups cannot recover SSH or
+TOTP secrets if this key is lost. The key protects copied files when kept
+separate; it cannot protect secrets from a compromised running panel or host
+root. For passkeys, set `WEBAUTHN_RP_ID` and `WEBAUTHN_ORIGIN` in the Compose
+`.env` file to match the HTTPS URL actually used in the browser.
 
 Running from source or from a binary:
 

@@ -1,0 +1,263 @@
+{% extends "base.html" %}
+{% block title_extra %}— Account security{% endblock %}
+{% block content %}
+<div class="page-header" style="max-width:760px;margin:24px auto 16px;padding:0 16px;">
+  <div>
+    <h1>Account security</h1>
+    <p class="text-muted" id="securityIntro"></p>
+  </div>
+</div>
+<div class="card" style="max-width:760px;margin:0 auto 24px;padding:24px;">
+  <div id="securityError" class="alert alert-error" style="display:none"></div>
+  <div id="securityInfo" class="alert alert-info" style="display:none"></div>
+
+  {% if security_mode in ['setup', 'manage'] %}
+  <section id="passkeySection" style="margin-bottom:24px">
+    <h2>Passkeys</h2>
+    <p class="text-muted">Passkeys use your device unlock or security key. Registration and use require HTTPS (except localhost).</p>
+    <div id="passkeyList"></div>
+    <button class="btn btn-primary" type="button" onclick="registerPasskey()">Add passkey</button>
+    <label class="form-label" for="passkeyLabel" style="margin-top:12px">Passkey name (optional)</label>
+    <input id="passkeyLabel" class="form-input" maxlength="64" placeholder="e.g. 1Password / Windows Hello">
+  </section>
+  <hr>
+  <section id="totpSection" style="margin:24px 0">
+    <h2>Authenticator app (TOTP)</h2>
+    <p class="text-muted">Use an authenticator app as an alternative or fallback to a passkey.</p>
+    <button class="btn btn-secondary" type="button" onclick="startTotp()">Set up / replace TOTP</button>
+    <div id="totpSetup" style="display:none;margin-top:16px">
+      <div id="totpQr" style="margin:12px 0"></div>
+      <p>Manual setup key: <code id="totpSecret"></code></p>
+      <label class="form-label" for="totpConfirmCode">Enter the current 6-digit code</label>
+      <input id="totpConfirmCode" class="form-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6">
+      <button class="btn btn-primary" type="button" onclick="confirmTotp()" style="margin-top:12px">Confirm TOTP</button>
+    </div>
+  </section>
+  {% endif %}
+
+  {% if security_mode in ['login', 'step-up'] %}
+  <section id="mfaChallengeSection">
+    <div id="passkeyLoginWrap" style="margin-bottom:20px">
+      <button class="btn btn-primary" type="button" id="passkeyLoginButton" onclick="authenticatePasskey()">Use a passkey</button>
+      <p class="text-muted" id="passkeyUnavailable" style="display:none">Passkeys require a supported browser and a secure HTTPS origin.</p>
+    </div>
+    <hr>
+    <label class="form-label" for="mfaMethod">Alternative verification</label>
+    <select id="mfaMethod" class="form-input">
+      <option value="totp">Authenticator code</option>
+      <option value="recovery">One-time recovery code</option>
+    </select>
+    <label class="form-label" for="mfaCode" style="margin-top:12px">Code</label>
+    <input id="mfaCode" class="form-input" autocomplete="one-time-code" autocapitalize="off" spellcheck="false">
+    <button class="btn btn-primary" type="button" onclick="submitMfaCode()" style="margin-top:12px">Verify</button>
+  </section>
+  {% endif %}
+
+  <section id="recoveryCodesSection" style="display:none;margin-top:24px">
+    <div class="alert alert-warning">Save these recovery codes somewhere safe. Each code works once; they will not be shown again.</div>
+    <pre id="recoveryCodes" style="white-space:pre-wrap;user-select:all;padding:16px;background:var(--bg-secondary);border-radius:8px"></pre>
+    <button class="btn btn-secondary" type="button" onclick="copyRecoveryCodes()">Copy codes</button>
+    <button class="btn btn-primary" type="button" onclick="finishRecoveryCodes()" style="margin-left:8px">I saved them</button>
+  </section>
+
+  {% if security_mode == 'manage' %}
+  <section style="margin-top:24px">
+    <h2>Recovery codes</h2>
+    <p class="text-muted">Remaining codes: <strong id="recoveryCount">—</strong>. Regenerating invalidates all previous codes.</p>
+    <button class="btn btn-secondary" type="button" onclick="regenerateRecoveryCodes()">Regenerate recovery codes</button>
+  </section>
+  {% endif %}
+</div>
+{% endblock %}
+{% block head_extra %}
+<script>window.SECURITY_MODE={{ security_mode|tojson }};window.SECURITY_RETURN_TO={{ (security_return_to or '/')|tojson }};</script>
+{% endblock %}
+{% block content_extra %}{% endblock %}
+{% block scripts %}
+<script>
+const mode = window.SECURITY_MODE;
+const returnTo = window.SECURITY_RETURN_TO || '/';
+let loginChallengeId = null;
+let cachedPasskeyOptions = null;
+
+function showError(message) {
+  const box = document.getElementById('securityError');
+  box.textContent = message || 'Request failed'; box.style.display = 'block';
+}
+function showInfo(message) {
+  const box = document.getElementById('securityInfo');
+  box.textContent = message || ''; box.style.display = message ? 'block' : 'none';
+}
+function b64uToBytes(value) {
+  const padded = value.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - value.length % 4) % 4);
+  const raw = atob(padded); return Uint8Array.from(raw, c => c.charCodeAt(0));
+}
+function bytesToB64u(value) {
+  const bytes = new Uint8Array(value); let raw = '';
+  bytes.forEach(b => raw += String.fromCharCode(b));
+  return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+function publicKeyOptions(raw, kind) {
+  const options = structuredClone(raw);
+  options.challenge = b64uToBytes(options.challenge);
+  if (kind === 'create') {
+    options.user.id = b64uToBytes(options.user.id);
+    for (const item of (options.excludeCredentials || [])) item.id = b64uToBytes(item.id);
+  } else {
+    for (const item of (options.allowCredentials || [])) item.id = b64uToBytes(item.id);
+  }
+  return options;
+}
+function credentialJSON(credential) {
+  const response = credential.response;
+  const out = {
+    id: credential.id, rawId: bytesToB64u(credential.rawId), type: credential.type,
+    authenticatorAttachment: credential.authenticatorAttachment || null,
+    clientExtensionResults: credential.getClientExtensionResults ? credential.getClientExtensionResults() : {},
+    response: { clientDataJSON: bytesToB64u(response.clientDataJSON) },
+  };
+  if (response.attestationObject) {
+    out.response.attestationObject = bytesToB64u(response.attestationObject);
+    if (response.getTransports) out.response.transports = response.getTransports();
+  } else {
+    out.response.authenticatorData = bytesToB64u(response.authenticatorData);
+    out.response.signature = bytesToB64u(response.signature);
+    if (response.userHandle) out.response.userHandle = bytesToB64u(response.userHandle);
+  }
+  return out;
+}
+async function api(path, body) {
+  const response = await fetch(path, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: body === undefined ? {} : {'Content-Type':'application/json'},
+    body: body === undefined ? undefined : JSON.stringify(body),
+    credentials: 'same-origin',
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    if (data.error_code === 'mfa_step_up_required' && mode === 'manage') {
+      window.location.href = '/security/step-up?return_to=%2Fsecurity';
+    }
+    throw new Error(data.error || `Request failed (${response.status})`);
+  }
+  return data;
+}
+function showCodes(codes) {
+  document.getElementById('recoveryCodes').textContent = codes.join('\n');
+  document.getElementById('recoveryCodesSection').style.display = 'block';
+  document.getElementById('mfaChallengeSection')?.setAttribute('hidden','hidden');
+  document.getElementById('passkeySection')?.setAttribute('hidden','hidden');
+  document.getElementById('totpSection')?.setAttribute('hidden','hidden');
+  document.getElementById('securityIntro').textContent = 'Save your recovery codes before continuing.';
+}
+async function copyRecoveryCodes() {
+  await navigator.clipboard.writeText(document.getElementById('recoveryCodes').textContent);
+  showInfo('Recovery codes copied.');
+}
+function finishRecoveryCodes() {
+  window.location.href = mode === 'setup' ? '/' : (mode === 'step-up' ? returnTo : '/security');
+}
+async function loadLoginOptions() {
+  if (mode !== 'login') return;
+  try {
+    const result = await api('/api/auth/mfa/login/options');
+    loginChallengeId = result.challenge_id || null;
+    cachedPasskeyOptions = result.passkey_options || null;
+    const passkeyButton = document.getElementById('passkeyLoginButton');
+    if (!cachedPasskeyOptions || !window.PublicKeyCredential) {
+      passkeyButton.disabled = true;
+      document.getElementById('passkeyUnavailable').style.display = 'block';
+    }
+    if (!result.totp_available) document.querySelector('#mfaMethod option[value="totp"]').disabled = true;
+    if (!result.recovery_available) document.querySelector('#mfaMethod option[value="recovery"]').disabled = true;
+    if (result.passkey_error) showInfo('Passkey setup needs HTTPS/RP configuration; use your enrolled fallback factor.');
+  } catch (err) { showError(err.message); }
+}
+async function authenticatePasskey() {
+  try {
+    let challengeId = loginChallengeId;
+    let rawOptions = cachedPasskeyOptions;
+    if (mode === 'step-up') {
+      const data = await api('/api/auth/mfa/step-up/passkey/options', {});
+      challengeId = data.challenge_id; rawOptions = data.options;
+    }
+    if (!rawOptions || !window.PublicKeyCredential) throw new Error('Passkeys are not available on this origin/browser.');
+    const credential = await navigator.credentials.get({publicKey: publicKeyOptions(rawOptions, 'get')});
+    const path = mode === 'login' ? '/api/auth/mfa/login/passkey' : '/api/auth/mfa/step-up/passkey/verify';
+    await api(path, {challenge_id: challengeId, credential: credentialJSON(credential)});
+    window.location.href = mode === 'login' ? '/' : returnTo;
+  } catch (err) { showError(err.message); }
+}
+async function submitMfaCode() {
+  try {
+    const body = {method: document.getElementById('mfaMethod').value,
+                  code: document.getElementById('mfaCode').value.trim()};
+    const path = mode === 'login' ? '/api/auth/mfa/login/code' : '/api/auth/mfa/step-up/code';
+    await api(path, body);
+    window.location.href = mode === 'login' ? '/' : returnTo;
+  } catch (err) { showError(err.message); }
+}
+async function registerPasskey() {
+  try {
+    if (!window.isSecureContext || !navigator.credentials) throw new Error('Passkey enrollment requires HTTPS (localhost is allowed for development).');
+    const data = await api('/api/auth/mfa/passkey/register/options', {});
+    const credential = await navigator.credentials.create({publicKey: publicKeyOptions(data.options, 'create')});
+    const result = await api('/api/auth/mfa/passkey/register/verify', {
+      challenge_id: data.challenge_id, credential: credentialJSON(credential),
+      label: document.getElementById('passkeyLabel')?.value || ''
+    });
+    if (result.recovery_codes) showCodes(result.recovery_codes);
+    else { showInfo('Passkey added.'); await loadStatus(); }
+  } catch (err) { showError(err.message); }
+}
+async function startTotp() {
+  try {
+    const data = await api('/api/auth/mfa/totp/start', {});
+    document.getElementById('totpSecret').textContent = data.secret;
+    document.getElementById('totpSetup').style.display = 'block';
+    document.getElementById('totpQr').replaceChildren();
+    if (window.QRCode) new QRCode(document.getElementById('totpQr'), {text:data.otpauth_uri,width:180,height:180});
+    showInfo('Scan the QR code or enter the manual key, then verify a current code.');
+  } catch (err) { showError(err.message); }
+}
+async function confirmTotp() {
+  try {
+    const result = await api('/api/auth/mfa/totp/confirm', {code:document.getElementById('totpConfirmCode').value.trim()});
+    if (result.recovery_codes) showCodes(result.recovery_codes);
+    else { showInfo('TOTP enabled.'); await loadStatus(); }
+  } catch (err) { showError(err.message); }
+}
+async function regenerateRecoveryCodes() {
+  if (!confirm('Regenerate codes? All existing recovery codes will stop working.')) return;
+  try { const data = await api('/api/auth/mfa/recovery/regenerate', {}); showCodes(data.recovery_codes); }
+  catch (err) { showError(err.message); }
+}
+async function removePasskey(id) {
+  if (!confirm('Remove this passkey?')) return;
+  try { await api('/api/auth/mfa/passkeys/remove', {credential_id:id}); await loadStatus(); }
+  catch (err) { showError(err.message); }
+}
+async function loadStatus() {
+  if (mode !== 'manage') return;
+  try {
+    const data = await api('/api/auth/mfa/status');
+    document.getElementById('recoveryCount').textContent = data.recovery_codes_remaining;
+    document.getElementById('passkeyList').innerHTML = '';
+    for (const item of data.passkeys) {
+      const row = document.createElement('div'); row.style.cssText='display:flex;gap:12px;align-items:center;margin:10px 0';
+      const label = document.createElement('span'); label.textContent = `${item.label} · ${new Date(item.created_at*1000).toLocaleString()}`;
+      const remove = document.createElement('button'); remove.className='btn btn-secondary btn-sm'; remove.textContent='Remove'; remove.onclick=()=>removePasskey(item.credential_id);
+      row.append(label,remove); document.getElementById('passkeyList').append(row);
+    }
+    document.getElementById('securityIntro').textContent = `TOTP ${data.totp_enabled ? 'enabled' : 'not enabled'} · ${data.passkeys.length} passkey(s)`;
+  } catch (err) { showError(err.message); }
+}
+
+document.getElementById('securityIntro').textContent = mode === 'setup'
+  ? 'Administrator MFA is required. Enroll a passkey (recommended) or authenticator app to continue.'
+  : mode === 'login' ? 'Verify your identity with an enrolled passkey, authenticator code, or one-time recovery code.'
+  : mode === 'step-up' ? 'Verify again to authorize this sensitive action.' : 'Manage your administrator sign-in factors.';
+if (mode === 'login') loadLoginOptions();
+if (mode === 'manage') loadStatus();
+</script>
+{% endblock %}

@@ -46,6 +46,7 @@ def load_handlers():
     ns = dict(app=app, Request=Request, BaseModel=BaseModel, Optional=Optional,
               JSONResponse=JSONResponse, StreamingResponse=StreamingResponse,
               io=io, CaptchaGenerator=generator, load_data=lambda: data,
+              admin_mfa_required=lambda: False,
               verify_password=Mock(return_value=True),
               _t=lambda key, lang: key)
     exec(compile(ast.Module(body=selected, type_ignores=[]), 'app.py', 'exec'), ns)

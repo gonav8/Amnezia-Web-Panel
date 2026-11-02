@@ -46,6 +46,34 @@ unverified counter to a verified one. Existing compatible JSON restore still
 preserves current usage/baselines; incompatible topology and unknown SSH outcomes
 remain blocked by their existing protections.
 
+## SSH credential encryption
+
+The panel encrypts saved SSH passwords/private keys and TOTP shared secrets
+inside `data.json` with AES-GCM. Before starting the Compose service for the
+first time on a new host, provision the master key on the host:
+
+```sh
+./scripts/init_ssh_credentials_key.sh
+docker compose up -d
+```
+
+The script creates `secrets/ssh-credentials.key` with restrictive permissions;
+Compose mounts it read-only at `/run/secrets/ssh-credentials-key`. The key is
+ignored by Git and is never included in a panel archive. Store an independent,
+protected copy of this key outside the data volume and outside the panel archive.
+Backups contain encrypted credential envelopes and require the same key to
+restore SSH access. If the key is lost, the saved credentials cannot be
+recovered; re-enter/revoke them on the managed servers. If the key is missing or
+invalid while encrypted state exists, the panel fails closed rather than
+silently dropping credentials.
+
+On upgrade, startup migrates legacy plaintext server credentials and historical
+recovery `before_base64` snapshots before serving requests. Keep a cold backup
+first. Old JSON exports copied elsewhere are not retroactively changed and must
+be securely deleted or protected separately. The encryption protects copied
+state/backups when the key is kept separate; it does not protect secrets from a
+compromised running panel or host root.
+
 ## Save deployment material separately
 
 The web process gets no root privileges. Compose/systemd/run flags, `.env` and

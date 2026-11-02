@@ -48,6 +48,8 @@ class NativeSpeedRace(unittest.TestCase):
                        Request=object, asyncio=asyncio, DATA_LOCK=asyncio.Lock(), JSONResponse=JSONResponse, DATA_FILE=str(self.data_file),
                        DEFAULT_MAIL_SETTINGS={}, DEFAULT_SELF_SERVICE_SETTINGS={},
                        _check_admin=lambda request: self.admin,
+                       unseal_panel_state=lambda data: data,
+                       seal_panel_state=lambda data: data,
                        logger=SimpleNamespace(warning=lambda *a: None, exception=lambda *a: None))
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), 'exec'), self.ns)
         self.user = dict(id='synthetic-user', username='before', enabled=False,

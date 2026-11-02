@@ -306,7 +306,11 @@
                 if (!res.ok) {
                     throw new Error(data.error || _('login_error'));
                 }
-                window.location.href = '/';
+                if (data.status === 'mfa_setup_required' || data.status === 'mfa_required') {
+                    window.location.href = data.next;
+                } else {
+                    window.location.href = '/';
+                }
             } catch (err) {
                 errEl.textContent = err.message;
                 errEl.classList.add('visible');

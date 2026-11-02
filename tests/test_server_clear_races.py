@@ -40,6 +40,7 @@ class ClearTests(unittest.IsolatedAsyncioTestCase):
                       DATA_FILE=str(self.path), DATA_LOCK=asyncio.Lock(),
                       DEFAULT_MAIL_SETTINGS={}, DEFAULT_SELF_SERVICE_SETTINGS={},
                       Request=Request, Optional=Optional, JSONResponse=JSONResponse,
+                      unseal_panel_state=lambda data: data, seal_panel_state=lambda data: data,
                       _check_admin=lambda r: r.headers.get('x-role', 'admin') == 'admin',
                       get_ssh=get_ssh, exit_link_svc=self.exit, logger=Mock())
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), 'exec'), self.p)

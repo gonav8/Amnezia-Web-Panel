@@ -45,6 +45,8 @@ def actual_code(path, data_file, request_type=object, response_type=JSONResponse
         _t=lambda key, lang: key,
         _normalize_telegram_id=lambda value: value,
         hash_password=lambda value: 'test-hash',
+        unseal_panel_state=lambda data: data,
+        seal_panel_state=lambda data: data,
         reconcile_user_state=reconcile_user_state,
         traffic_server_identity=traffic_server_identity, _USER_STATE_TASKS={},
     )
@@ -288,7 +290,7 @@ class SnapshotRace(unittest.IsolatedAsyncioTestCase):
 from pathlib import Path
 tree=ast.parse(Path(sys.argv[1]).read_text(encoding='utf-8'))
 node=next(n for n in tree.body if getattr(n,'name','')=='load_data')
-ns=dict(os=os,json=json,DATA_FILE=sys.argv[2],DEFAULT_MAIL_SETTINGS={},DEFAULT_SELF_SERVICE_SETTINGS={})
+ns=dict(os=os,json=json,DATA_FILE=sys.argv[2],DEFAULT_MAIL_SETTINGS={},DEFAULT_SELF_SERVICE_SETTINGS={},unseal_panel_state=lambda data:data)
 exec(compile(ast.Module(body=[node],type_ignores=[]),sys.argv[1],'exec'),ns)
 print(json.dumps(ns['load_data']()))
 """

@@ -43,6 +43,8 @@ class SpeedApi(unittest.IsolatedAsyncioTestCase):
             DATA_FILE=str(self.file), DATA_LOCK=asyncio.Lock(), DEFAULT_MAIL_SETTINGS={},
             DEFAULT_SELF_SERVICE_SETTINGS={}, logger=Mock(), WireGuardManager=type('Unused', (), {}))
         self.ns['_check_admin'] = lambda r: {'role': r.headers.get('X-Synthetic-Role', 'none')}
+        self.ns['unseal_panel_state'] = lambda data: data
+        self.ns['seal_panel_state'] = lambda data: data
         names = {'load_data', 'save_data', 'ConnectionSpeedRequest', 'api_set_connection_speed', '_manager_call'}
         tree = ast.parse(SOURCE.read_text(encoding='utf-8'))
         nodes = [n for n in tree.body if getattr(n, 'name', '') in names]

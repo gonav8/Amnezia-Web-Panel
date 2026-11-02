@@ -56,6 +56,9 @@ class CrudTests(unittest.IsolatedAsyncioTestCase):
                       DEFAULT_MAIL_SETTINGS={}, DEFAULT_SELF_SERVICE_SETTINGS={},
                       DATA_LOCK=asyncio.Lock(), SERVER_MUTATION_LOCK=asyncio.Lock(),
                       _check_admin=lambda r: r.headers.get('x-role', 'admin') == 'admin',
+                      _require_recent_admin_mfa=lambda r: {'role': 'admin'},
+                      unseal_panel_state=lambda data: data,
+                      seal_panel_state=lambda data: data,
                       _traffic_removal_guard=lambda *a, **k: None,
                       serialize_peer_lifecycle=lambda f: f,
                       SSHManager=Mock(return_value=self.ssh), drop_ssh=Mock(), exit_link_svc=self.exit)

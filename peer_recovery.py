@@ -340,7 +340,11 @@ class RecoveryStore:
         path = self._path(operation_id)
         after = copy.deepcopy(after)
         after[GENERATION] = operation_id
-        output = json.dumps(after, indent=2, ensure_ascii=False, allow_nan=False).encode()
+        # Recovery/finalization commits bypass app.save_data; preserve the same
+        # encrypted-at-rest state invariant at this second write boundary.
+        from secret_store import seal_panel_state
+        output = json.dumps(seal_panel_state(after), indent=2,
+                            ensure_ascii=False, allow_nan=False).encode()
         record = {'version': 1, 'actor': actor, 'kind': kind, 'intent': intent,
                   'before_sha256': file_hash(before), 'before_base64': base64.b64encode(before).decode(),
                   'after_sha256': file_hash(output), 'phase': 'prepared',

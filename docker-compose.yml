@@ -11,8 +11,15 @@ services:
     volumes:
       - amnezia_data:/app/data
 
+    secrets:
+      - ssh_credentials_key
+
     environment:
       DATA_FILE: /app/data/data.json
+      SSH_CREDENTIALS_KEY_FILE: /run/secrets/ssh-credentials-key
+      PANEL_ADMIN_MFA_REQUIRED: ${PANEL_ADMIN_MFA_REQUIRED:-1}
+      WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-}
+      WEBAUTHN_ORIGIN: ${WEBAUTHN_ORIGIN:-}
     restart: unless-stopped
 
     healthcheck:
@@ -24,3 +31,7 @@ services:
 
 volumes:
   amnezia_data:
+
+secrets:
+  ssh_credentials_key:
+    file: ./secrets/ssh-credentials.key

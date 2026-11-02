@@ -113,7 +113,8 @@ class ExitCleanupRaces(unittest.IsolatedAsyncioTestCase):
             source = Path(__file__).resolve().parents[1] / 'app.py'
             tree = ast.parse(source.read_text(encoding='utf-8'))
             fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'save_data')
-            ns = dict(DATA_FILE=str(path), os=os, json=json, tempfile=tempfile)
+            ns = dict(DATA_FILE=str(path), os=os, json=json, tempfile=tempfile,
+                      seal_panel_state=lambda data: data)
             exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), 'exec'), ns)
             save = ns['save_data']
             save(h.data)

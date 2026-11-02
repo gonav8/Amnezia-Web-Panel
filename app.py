@@ -35,7 +35,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi import FastAPI, Request, Query, UploadFile, File, Form
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field, StrictBool, constr, conint
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 import uvicorn
 import httpx
 
@@ -72,6 +72,32 @@ from connection_service import (
     sanitize_allowed_protocols,
     self_service_protocol_choices,
 )
+from secret_store import (
+    SecretStorageError,
+    has_legacy_plaintext_secrets,
+    load_master_key,
+    seal_panel_state,
+    seal_legacy_recovery_snapshots,
+    unseal_panel_state,
+)
+from auth_mfa import (
+    CHALLENGES as MFA_CHALLENGES,
+    MFAError,
+    OneTimeChallengeStore,
+    authentication_options,
+    consume_recovery_code,
+    generate_recovery_codes,
+    hash_recovery_code,
+    mfa_enrolled,
+    new_totp_secret,
+    registration_options,
+    totp_uri,
+    verify_passkey_authentication,
+    verify_passkey_registration,
+    verify_totp,
+)
+
+MFA_ENROLLMENT_SECRETS = OneTimeChallengeStore(ttl=600)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -144,6 +170,9 @@ async def noindex_middleware(request, call_next):
     """
     response = await call_next(request)
     response.headers['X-Robots-Tag'] = 'noindex, nofollow'
+    if request.url.path.startswith('/api/auth/mfa/'):
+        response.headers['Cache-Control'] = 'no-store, private'
+        response.headers['Pragma'] = 'no-cache'
     return response
 
 
@@ -294,6 +323,33 @@ async def close_panel_lease():
         _panel_lease.close()
 
 
+@app.on_event('startup')
+async def migrate_legacy_secret_state():
+    """Encrypt legacy SSH/TOTP secrets before accepting requests.
+
+    The encryption key is a separately provisioned host secret. If a state file
+    contains legacy plaintext credentials but the key is missing or invalid,
+    fail startup rather than silently preserving plaintext or losing access.
+    """
+    if not os.path.exists(DATA_FILE):
+        return
+    try:
+        with open(DATA_FILE, 'r', encoding='utf-8') as source:
+            raw_data = json.load(source)
+        legacy_plaintext = has_legacy_plaintext_secrets(raw_data)
+        data = unseal_panel_state(raw_data)
+        if legacy_plaintext:
+            load_master_key()  # fail before writing if the separate key is absent
+            save_data(data)
+            logger.info('Migrated legacy SSH/authenticator secrets to encrypted state')
+        migrated = seal_legacy_recovery_snapshots(DATA_FILE + '.recovery')
+        if migrated:
+            logger.info('Encrypted %d historical recovery snapshot(s)', migrated)
+    except SecretStorageError as exc:
+        logger.critical('Panel secret protection is not ready (%s); provision the external key file before startup', exc)
+        raise
+
+
 @app.exception_handler(peer_lifecycle_lock.PeerLifecycleBusy)
 async def lifecycle_busy_response(request, error):
     return JSONResponse({'error': 'A lifecycle operation is still running. Retry later.',
@@ -363,7 +419,7 @@ def load_data():
         # (server['rknblock']). The old flag is dropped so every server shows
         # "not installed" until the app is installed from the store.
         server.pop('rkn_block_enabled', None)
-    return data
+    return unseal_panel_state(data)
 
 
 def save_data(data):
@@ -376,7 +432,7 @@ def save_data(data):
             if generation and data.get(GENERATION) != generation:
                 raise RecoveryError('stale_snapshot_after_recovery')
         os.makedirs(os.path.dirname(DATA_FILE) or '.', exist_ok=True)
-        atomic_json(DATA_FILE, data)
+        atomic_json(DATA_FILE, seal_panel_state(data))
 
 
 async def save_data_async(data):
@@ -2235,6 +2291,11 @@ async def sync_users_with_remnawave(data: dict):
         return 0, f"Error: {str(e)}"
 
 
+def admin_mfa_required() -> bool:
+    """MFA is mandatory by default; the opt-out exists only for controlled tests/migrations."""
+    return os.environ.get('PANEL_ADMIN_MFA_REQUIRED', '1').strip().lower() not in ('0', 'false', 'no')
+
+
 def get_current_user(request: Request):
     user_id = request.session.get('user_id')
     if not user_id:
@@ -2243,6 +2304,10 @@ def get_current_user(request: Request):
     for u in data.get('users', []):
         if u['id'] == user_id:
             if not u.get('enabled', True) or u.get('role') == 'none':
+                return None
+            # Invalidate pre-MFA admin sessions after upgrade. The login handler
+            # only sets user_id after successful second-factor verification.
+            if admin_mfa_required() and u.get('role') == 'admin' and not request.session.get('mfa_at'):
                 return None
             return u
     return None
@@ -2322,6 +2387,21 @@ class LoginRequest(BaseModel):
     username: str
     password: str
     captcha: Optional[str] = None
+
+
+class MFACodeRequest(BaseModel):
+    code: constr(min_length=1, max_length=128)
+    method: constr(min_length=1, max_length=16) = 'totp'
+
+
+class MFAWebAuthnRequest(BaseModel):
+    challenge_id: constr(min_length=10, max_length=100)
+    credential: Dict[str, Any]
+    label: constr(max_length=64) = ''
+
+
+class MFAPasskeyRemovalRequest(BaseModel):
+    credential_id: constr(min_length=1, max_length=2048)
 
 
 class AddServerRequest(BaseModel):
@@ -3173,7 +3253,54 @@ async def exit_failover_background_loop():
 def login_page(request: Request):
     if get_current_user(request):
         return RedirectResponse(url='/', status_code=302)
+    if _pending_admin(request, 'enroll'):
+        return RedirectResponse(url='/security/setup', status_code=302)
+    if _pending_admin(request, 'pending'):
+        return RedirectResponse(url='/security/mfa', status_code=302)
     return tpl(request, 'login.html')
+
+
+@app.get('/security/setup', response_class=HTMLResponse, tags=["System Templates"])
+def security_setup_page(request: Request):
+    user = _pending_admin(request, 'enroll')
+    if not user:
+        return RedirectResponse(url='/login', status_code=302)
+    return tpl(request, 'security.html', security_mode='setup', security_username=user['username'])
+
+
+@app.get('/security/mfa', response_class=HTMLResponse, tags=["System Templates"])
+def security_login_mfa_page(request: Request):
+    user = _pending_admin(request, 'pending')
+    if not user:
+        return RedirectResponse(url='/login', status_code=302)
+    return tpl(request, 'security.html', security_mode='login', security_username=user['username'])
+
+
+@app.get('/security/step-up', response_class=HTMLResponse, tags=["System Templates"])
+def security_step_up_page(request: Request, return_to: str = '/settings'):
+    user = get_current_user(request)
+    if not user or user.get('role') != 'admin':
+        return RedirectResponse(url='/login', status_code=302)
+    parsed = urllib.parse.urlsplit(return_to)
+    decoded_target = urllib.parse.unquote(return_to)
+    if (parsed.scheme or parsed.netloc or not parsed.path.startswith('/') or
+            parsed.path.startswith('//') or '\\' in decoded_target or
+            any(ord(c) < 32 for c in decoded_target)):
+        return_to = '/settings'
+    elif parsed.path.startswith('/security/'):
+        return_to = '/settings'
+    else:
+        return_to = parsed.path + (('?' + parsed.query) if parsed.query else '')
+    return tpl(request, 'security.html', security_mode='step-up',
+               security_username=user['username'], security_return_to=return_to)
+
+
+@app.get('/security', response_class=HTMLResponse, tags=["System Templates"])
+def security_management_page(request: Request):
+    user = get_current_user(request)
+    if not user or user.get('role') != 'admin':
+        return RedirectResponse(url='/login', status_code=302)
+    return tpl(request, 'security.html', security_mode='manage', security_username=user['username'])
 
 
 @app.get("/set_lang/{lang}", tags=["System Templates"])
@@ -3324,13 +3451,450 @@ def api_login(request: Request, req: LoginRequest):
                 return JSONResponse({'error': _t('invalid_login', lang)}, status_code=401)
             if not u.get('enabled', True):
                 return JSONResponse({'error': _t('account_disabled', lang)}, status_code=403)
+            request.session.clear()  # rotate the signed session after password verification
+            if u.get('role') == 'admin' and admin_mfa_required():
+                if not mfa_enrolled(u.get('mfa')):
+                    request.session['mfa_enroll_user_id'] = u['id']
+                    request.session['mfa_enroll_at'] = int(time.time())
+                    return {'status': 'mfa_setup_required', 'next': '/security/setup'}
+                request.session['mfa_pending_user_id'] = u['id']
+                request.session['mfa_pending_at'] = int(time.time())
+                return {'status': 'mfa_required', 'next': '/security/mfa'}
             request.session['user_id'] = u['id']
             return {'status': 'success', 'role': u['role']}
     lang = request.cookies.get('lang', 'ru')
     return JSONResponse({'error': _t('invalid_login', lang)}, status_code=401)
 
 
+# ======================== ADMIN MFA API ========================
+
+_MFA_FAILURES = {}
+_MFA_FAILURES_LOCK = threading.Lock()
+
+
+def _webauthn_payload_is_bounded(credential: dict) -> bool:
+    try:
+        return len(json.dumps(credential, separators=(',', ':'), ensure_ascii=True)) <= 65536
+    except (TypeError, ValueError):
+        return False
+
+
+def _mfa_attempt_allowed(request: Request, user_id: str) -> bool:
+    now = time.time()
+    ip = request.client.host if request.client else 'unknown'
+    key = (ip[:128], str(user_id))
+    with _MFA_FAILURES_LOCK:
+        attempts = [t for t in _MFA_FAILURES.get(key, []) if now - t < 600]
+        _MFA_FAILURES[key] = attempts
+        return len(attempts) < 5
+
+
+def _mfa_attempt_failed(request: Request, user_id: str):
+    ip = request.client.host if request.client else 'unknown'
+    key = (ip[:128], str(user_id))
+    with _MFA_FAILURES_LOCK:
+        attempts = [t for t in _MFA_FAILURES.get(key, []) if time.time() - t < 600]
+        attempts.append(time.time())
+        _MFA_FAILURES[key] = attempts
+        if len(_MFA_FAILURES) > 4096:
+            cutoff = time.time() - 600
+            for stale_key in [k for k, values in _MFA_FAILURES.items()
+                              if not values or values[-1] <= cutoff]:
+                _MFA_FAILURES.pop(stale_key, None)
+            while len(_MFA_FAILURES) > 4096:
+                _MFA_FAILURES.pop(next(iter(_MFA_FAILURES)), None)
+
+
+def _mfa_attempt_succeeded(request: Request, user_id: str):
+    ip = request.client.host if request.client else 'unknown'
+    with _MFA_FAILURES_LOCK:
+        _MFA_FAILURES.pop((ip[:128], str(user_id)), None)
+
+
+def _consume_admin_code(user_id: str, method: str, code: str) -> bool:
+    with STATE_FILE_LOCK:
+        data = load_data()
+        user = next((u for u in data.get('users', []) if u.get('id') == user_id), None)
+        if not user or user.get('role') != 'admin' or not user.get('enabled', True):
+            return False
+        mfa = user.get('mfa') or {}
+        if method == 'totp':
+            secret = mfa.get('totp_secret')
+            if not isinstance(secret, str) or not secret:
+                return False
+            counter = verify_totp(secret, code,
+                                  last_counter=int(mfa.get('totp_last_counter', -1)))
+            if counter is None:
+                return False
+            mfa['totp_last_counter'] = counter
+        elif method == 'recovery':
+            if not consume_recovery_code(mfa, code):
+                return False
+        else:
+            return False
+        user['mfa'] = mfa
+        save_data(data)
+        return True
+
+
+def _consume_admin_passkey(user_id: str, credential: dict, challenge_id: str) -> bool:
+    with STATE_FILE_LOCK:
+        data = load_data()
+        user = next((u for u in data.get('users', []) if u.get('id') == user_id), None)
+        if not user or user.get('role') != 'admin' or not user.get('enabled', True):
+            return False
+        mfa = user.get('mfa') or {}
+        credential_id = credential.get('id') if isinstance(credential, dict) else None
+        record = next((p for p in mfa.get('passkeys', [])
+                       if p.get('credential_id') == credential_id), None)
+        if not record:
+            return False
+        new_count = verify_passkey_authentication(credential, challenge_id, record)
+        record['sign_count'] = new_count
+        user['mfa'] = mfa
+        save_data(data)
+        return True
+
+
+def _mfa_factor_owner(request: Request):
+    pending = _pending_admin(request, 'enroll')
+    if pending:
+        return pending, True
+    current = get_current_user(request)
+    if current and current.get('role') == 'admin':
+        stamped = request.session.get('mfa_at')
+        if isinstance(stamped, (int, float)) and time.time() - stamped <= 300:
+            return current, False
+    return JSONResponse({'error': 'Administrator MFA verification required',
+                         'error_code': 'mfa_step_up_required'}, status_code=403), False
+
+
+@app.get('/api/auth/mfa/login/options', tags=['Authentication'])
+def api_mfa_login_options(request: Request):
+    user = _pending_admin(request, 'pending')
+    if not user:
+        return JSONResponse({'error': 'MFA login session expired'}, status_code=401)
+    passkeys = (user.get('mfa') or {}).get('passkeys', [])
+    result = {'totp_available': bool((user.get('mfa') or {}).get('totp_secret')),
+              'recovery_available': bool((user.get('mfa') or {}).get('recovery_code_hashes')),
+              'passkey_available': bool(passkeys)}
+    if passkeys:
+        try:
+            challenge_id, options = authentication_options(passkeys)
+            request.session['mfa_login_challenge_id'] = challenge_id
+            result.update(challenge_id=challenge_id, passkey_options=options)
+        except MFAError as exc:
+            # TOTP/recovery remain available when the HTTPS/RP configuration is
+            # incomplete; never downgrade the verification requirement itself.
+            result['passkey_error'] = str(exc)
+    return result
+
+
+@app.post('/api/auth/mfa/login/code', tags=['Authentication'])
+def api_mfa_login_code(request: Request, req: MFACodeRequest):
+    user = _pending_admin(request, 'pending')
+    if not user:
+        return JSONResponse({'error': 'MFA login session expired'}, status_code=401)
+    if not _mfa_attempt_allowed(request, user['id']):
+        return JSONResponse({'error': 'Too many MFA attempts; try again later'}, status_code=429)
+    if not _consume_admin_code(user['id'], req.method, req.code):
+        _mfa_attempt_failed(request, user['id'])
+        return JSONResponse({'error': 'Invalid or already-used verification code'}, status_code=401)
+    _mfa_attempt_succeeded(request, user['id'])
+    current = next((u for u in load_data().get('users', []) if u.get('id') == user['id']), user)
+    return _complete_admin_mfa_login(request, current)
+
+
+@app.post('/api/auth/mfa/login/passkey', tags=['Authentication'])
+def api_mfa_login_passkey(request: Request, req: MFAWebAuthnRequest):
+    user = _pending_admin(request, 'pending')
+    if not user:
+        return JSONResponse({'error': 'MFA login session expired'}, status_code=401)
+    challenge_id = request.session.pop('mfa_login_challenge_id', None)
+    if not challenge_id or not secrets.compare_digest(str(challenge_id), req.challenge_id):
+        return JSONResponse({'error': 'Passkey challenge expired; retry'}, status_code=400)
+    if not _webauthn_payload_is_bounded(req.credential):
+        return JSONResponse({'error': 'Passkey response exceeds size limit'}, status_code=413)
+    try:
+        if not _consume_admin_passkey(user['id'], req.credential, challenge_id):
+            _mfa_attempt_failed(request, user['id'])
+            return JSONResponse({'error': 'Passkey is not registered'}, status_code=401)
+    except Exception as exc:
+        logger.info('Passkey login verification rejected (%s)', type(exc).__name__)
+        _mfa_attempt_failed(request, user['id'])
+        return JSONResponse({'error': 'Passkey verification failed'}, status_code=401)
+    _mfa_attempt_succeeded(request, user['id'])
+    current = next((u for u in load_data().get('users', []) if u.get('id') == user['id']), user)
+    return _complete_admin_mfa_login(request, current)
+
+
+@app.post('/api/auth/mfa/passkey/register/options', tags=['Authentication'])
+def api_mfa_passkey_register_options(request: Request):
+    owner, initial_setup = _mfa_factor_owner(request)
+    if isinstance(owner, JSONResponse):
+        return owner
+    mfa = owner.get('mfa') or {}
+    if len(mfa.get('passkeys', [])) >= 10:
+        return JSONResponse({'error': 'Maximum of 10 passkeys reached'}, status_code=400)
+    try:
+        challenge_id, options = registration_options(owner, mfa.get('passkeys', []))
+    except MFAError as exc:
+        return JSONResponse({'error': str(exc)}, status_code=503)
+    request.session['mfa_register_challenge_id'] = challenge_id
+    request.session['mfa_register_user_id'] = owner['id']
+    request.session['mfa_register_initial'] = bool(initial_setup)
+    return {'challenge_id': challenge_id, 'options': options}
+
+
+@app.post('/api/auth/mfa/passkey/register/verify', tags=['Authentication'])
+def api_mfa_passkey_register_verify(request: Request, req: MFAWebAuthnRequest):
+    owner, initial_setup = _mfa_factor_owner(request)
+    if isinstance(owner, JSONResponse):
+        return owner
+    challenge_id = request.session.pop('mfa_register_challenge_id', None)
+    bound_user_id = request.session.pop('mfa_register_user_id', None)
+    initial_flag = request.session.pop('mfa_register_initial', False)
+    if (not challenge_id or bound_user_id != owner['id'] or
+            not secrets.compare_digest(str(challenge_id), req.challenge_id) or
+            bool(initial_flag) != bool(initial_setup)):
+        return JSONResponse({'error': 'Registration challenge expired; retry'}, status_code=400)
+    if not _webauthn_payload_is_bounded(req.credential):
+        return JSONResponse({'error': 'Passkey response exceeds size limit'}, status_code=413)
+    try:
+        record = verify_passkey_registration(req.credential, challenge_id)
+    except Exception as exc:
+        logger.info('Passkey registration rejected (%s)', type(exc).__name__)
+        return JSONResponse({'error': 'Passkey registration verification failed'}, status_code=400)
+    label = re.sub(r'[^\w .()-]', '', req.label).strip()[:64] or 'Passkey'
+    with STATE_FILE_LOCK:
+        data = load_data()
+        current = next((u for u in data.get('users', []) if u.get('id') == owner['id']), None)
+        if not current or current.get('role') != 'admin' or not current.get('enabled', True):
+            return JSONResponse({'error': 'Administrator account is unavailable'}, status_code=403)
+        mfa = current.setdefault('mfa', {})
+        passkeys = mfa.setdefault('passkeys', [])
+        if any(p.get('credential_id') == record['credential_id'] for p in passkeys):
+            return JSONResponse({'error': 'This passkey is already registered'}, status_code=409)
+        if len(passkeys) >= 10:
+            return JSONResponse({'error': 'Maximum of 10 passkeys reached'}, status_code=400)
+        record['label'] = label
+        passkeys.append(record)
+        mfa['enabled'] = True
+        codes = generate_recovery_codes()
+        mfa['recovery_code_hashes'] = [hash_recovery_code(code) for code in codes]
+        current['mfa'] = mfa
+        save_data(data)
+    if initial_setup:
+        result = _complete_admin_mfa_login(request, current)
+    else:
+        request.session['mfa_at'] = int(time.time())
+        result = {'status': 'success'}
+    result['recovery_codes'] = codes
+    return result
+
+
+@app.post('/api/auth/mfa/totp/start', tags=['Authentication'])
+def api_mfa_totp_start(request: Request):
+    owner, _initial = _mfa_factor_owner(request)
+    if isinstance(owner, JSONResponse):
+        return owner
+    secret = new_totp_secret()
+    challenge_id = MFA_ENROLLMENT_SECRETS.issue(secret.encode('ascii'))
+    request.session['mfa_totp_enrollment_id'] = challenge_id
+    request.session['mfa_totp_enrollment_user_id'] = owner['id']
+    return {'secret': secret, 'otpauth_uri': totp_uri(secret, owner.get('username', 'admin'))}
+
+
+@app.post('/api/auth/mfa/totp/confirm', tags=['Authentication'])
+def api_mfa_totp_confirm(request: Request, req: MFACodeRequest):
+    owner, initial_setup = _mfa_factor_owner(request)
+    if isinstance(owner, JSONResponse):
+        return owner
+    if not _mfa_attempt_allowed(request, owner['id']):
+        return JSONResponse({'error': 'Too many MFA attempts; try again later'}, status_code=429)
+    enrollment_id = request.session.pop('mfa_totp_enrollment_id', None)
+    bound_user_id = request.session.pop('mfa_totp_enrollment_user_id', None)
+    if not enrollment_id or bound_user_id != owner['id']:
+        return JSONResponse({'error': 'TOTP setup expired; start again'}, status_code=400)
+    try:
+        secret = MFA_ENROLLMENT_SECRETS.take(enrollment_id).decode('ascii')
+    except (MFAError, UnicodeDecodeError):
+        return JSONResponse({'error': 'TOTP setup expired; start again'}, status_code=400)
+    counter = verify_totp(secret, req.code)
+    if counter is None:
+        _mfa_attempt_failed(request, owner['id'])
+        return JSONResponse({'error': 'Invalid TOTP code; start setup again'}, status_code=400)
+    _mfa_attempt_succeeded(request, owner['id'])
+    with STATE_FILE_LOCK:
+        data = load_data()
+        current = next((u for u in data.get('users', []) if u.get('id') == owner['id']), None)
+        if not current or current.get('role') != 'admin' or not current.get('enabled', True):
+            return JSONResponse({'error': 'Administrator account is unavailable'}, status_code=403)
+        mfa = current.setdefault('mfa', {})
+        mfa['totp_secret'] = secret
+        mfa['totp_last_counter'] = counter
+        mfa['enabled'] = True
+        codes = generate_recovery_codes()
+        mfa['recovery_code_hashes'] = [hash_recovery_code(code) for code in codes]
+        current['mfa'] = mfa
+        save_data(data)
+    if initial_setup:
+        result = _complete_admin_mfa_login(request, current)
+    else:
+        request.session['mfa_at'] = int(time.time())
+        result = {'status': 'success'}
+    result['recovery_codes'] = codes
+    return result
+
+
+@app.post('/api/auth/mfa/step-up/code', tags=['Authentication'])
+def api_mfa_step_up_code(request: Request, req: MFACodeRequest):
+    user = get_current_user(request)
+    if not user or user.get('role') != 'admin':
+        return JSONResponse({'error': 'Administrator session required'}, status_code=403)
+    if not _mfa_attempt_allowed(request, user['id']):
+        return JSONResponse({'error': 'Too many MFA attempts; try again later'}, status_code=429)
+    if not _consume_admin_code(user['id'], req.method, req.code):
+        _mfa_attempt_failed(request, user['id'])
+        return JSONResponse({'error': 'Invalid or already-used verification code'}, status_code=401)
+    _mfa_attempt_succeeded(request, user['id'])
+    request.session['mfa_at'] = int(time.time())
+    return {'status': 'success'}
+
+
+@app.post('/api/auth/mfa/step-up/passkey/options', tags=['Authentication'])
+def api_mfa_step_up_passkey_options(request: Request):
+    user = get_current_user(request)
+    if not user or user.get('role') != 'admin':
+        return JSONResponse({'error': 'Administrator session required'}, status_code=403)
+    try:
+        challenge_id, options = authentication_options((user.get('mfa') or {}).get('passkeys', []))
+    except MFAError as exc:
+        return JSONResponse({'error': str(exc)}, status_code=503)
+    request.session['mfa_stepup_challenge_id'] = challenge_id
+    return {'challenge_id': challenge_id, 'options': options}
+
+
+@app.post('/api/auth/mfa/step-up/passkey/verify', tags=['Authentication'])
+def api_mfa_step_up_passkey_verify(request: Request, req: MFAWebAuthnRequest):
+    user = get_current_user(request)
+    if not user or user.get('role') != 'admin':
+        return JSONResponse({'error': 'Administrator session required'}, status_code=403)
+    challenge_id = request.session.pop('mfa_stepup_challenge_id', None)
+    if not challenge_id or not secrets.compare_digest(str(challenge_id), req.challenge_id):
+        return JSONResponse({'error': 'Passkey challenge expired; retry'}, status_code=400)
+    if not _webauthn_payload_is_bounded(req.credential):
+        return JSONResponse({'error': 'Passkey response exceeds size limit'}, status_code=413)
+    try:
+        if not _consume_admin_passkey(user['id'], req.credential, challenge_id):
+            return JSONResponse({'error': 'Passkey is not registered'}, status_code=401)
+    except Exception as exc:
+        logger.info('Passkey step-up rejected (%s)', type(exc).__name__)
+        return JSONResponse({'error': 'Passkey verification failed'}, status_code=401)
+    request.session['mfa_at'] = int(time.time())
+    return {'status': 'success'}
+
+
+@app.get('/api/auth/mfa/status', tags=['Authentication'])
+def api_mfa_status(request: Request):
+    user = get_current_user(request)
+    if not user or user.get('role') != 'admin':
+        return JSONResponse({'error': 'Administrator session required'}, status_code=403)
+    mfa = user.get('mfa') or {}
+    return {'enabled': mfa_enrolled(mfa), 'totp_enabled': bool(mfa.get('totp_secret')),
+            'passkeys': [{'credential_id': p.get('credential_id'),
+                          'label': p.get('label', 'Passkey'),
+                          'created_at': p.get('created_at')}
+                         for p in mfa.get('passkeys', [])],
+            'recovery_codes_remaining': len(mfa.get('recovery_code_hashes', []))}
+
+
+@app.post('/api/auth/mfa/recovery/regenerate', tags=['Authentication'])
+def api_mfa_recovery_regenerate(request: Request):
+    user = _require_recent_admin_mfa(request)
+    if isinstance(user, JSONResponse):
+        return user
+    codes = generate_recovery_codes()
+    with STATE_FILE_LOCK:
+        data = load_data()
+        current = next((u for u in data.get('users', []) if u.get('id') == user['id']), None)
+        if not current:
+            return JSONResponse({'error': 'Administrator account unavailable'}, status_code=403)
+        mfa = current.setdefault('mfa', {})
+        mfa['recovery_code_hashes'] = [hash_recovery_code(code) for code in codes]
+        save_data(data)
+    return {'status': 'success', 'recovery_codes': codes}
+
+
+@app.post('/api/auth/mfa/passkeys/remove', tags=['Authentication'])
+def api_mfa_passkey_remove(request: Request, req: MFAPasskeyRemovalRequest):
+    user = _require_recent_admin_mfa(request)
+    if isinstance(user, JSONResponse):
+        return user
+    with STATE_FILE_LOCK:
+        data = load_data()
+        current = next((u for u in data.get('users', []) if u.get('id') == user['id']), None)
+        if not current:
+            return JSONResponse({'error': 'Administrator account unavailable'}, status_code=403)
+        mfa = current.get('mfa') or {}
+        passkeys = mfa.get('passkeys', [])
+        remaining = [p for p in passkeys if p.get('credential_id') != req.credential_id]
+        if len(remaining) == len(passkeys):
+            return JSONResponse({'error': 'Passkey not found'}, status_code=404)
+        if not remaining and not mfa.get('totp_secret'):
+            return JSONResponse({'error': 'Cannot remove the last authenticator'}, status_code=400)
+        mfa['passkeys'] = remaining
+        current['mfa'] = mfa
+        save_data(data)
+    return {'status': 'success'}
+
+
 # ======================== SERVER API (admin/support) ========================
+
+def _pending_admin(request, purpose: str):
+    user_id = request.session.get(f'mfa_{purpose}_user_id')
+    started = request.session.get(f'mfa_{purpose}_at')
+    if not user_id or not isinstance(started, (int, float)) or time.time() - started > 600:
+        request.session.pop(f'mfa_{purpose}_user_id', None)
+        request.session.pop(f'mfa_{purpose}_at', None)
+        return None
+    user = next((u for u in load_data().get('users', []) if u.get('id') == user_id), None)
+    if not user or user.get('role') != 'admin' or not user.get('enabled', True):
+        request.session.pop(f'mfa_{purpose}_user_id', None)
+        request.session.pop(f'mfa_{purpose}_at', None)
+        return None
+    return user
+
+
+def _complete_admin_mfa_login(request: Request, user: dict):
+    request.session.clear()
+    request.session['user_id'] = user['id']
+    request.session['mfa_at'] = int(time.time())
+    return {'status': 'success', 'role': 'admin'}
+
+
+def _require_recent_admin_mfa(request: Request, max_age: int = 300):
+    if not admin_mfa_required():
+        actor = _check_admin(request)
+        if actor and (not isinstance(actor, dict) or actor.get('role') == 'admin'):
+            return actor
+        return JSONResponse({'error': 'Forbidden', 'error_code': 'forbidden'}, status_code=403)
+    user = get_current_user(request)
+    if not user or user.get('role') != 'admin':
+        return JSONResponse({'error': 'Administrator session required',
+                             'error_code': 'forbidden'}, status_code=403)
+    if not mfa_enrolled(user.get('mfa')):
+        return JSONResponse({'error': 'Complete administrator MFA enrollment first',
+                             'error_code': 'mfa_enrollment_required',
+                             'setup_url': '/security/setup'}, status_code=403)
+    stamped = request.session.get('mfa_at')
+    if not isinstance(stamped, (int, float)) or time.time() - stamped > max_age:
+        return JSONResponse({'error': 'Fresh MFA verification required',
+                             'error_code': 'mfa_step_up_required',
+                             'step_up_url': '/security/step-up',
+                             'return_to': request.url.path}, status_code=403)
+    return user
+
 
 def _check_admin(request):
     """Authorize an admin/support action via session cookie OR Bearer token.
@@ -3689,7 +4253,9 @@ async def api_test_server(request: Request, req: AddServerRequest):
 @app.post('/api/servers/add', tags=["Servers"])
 @serialize_peer_lifecycle
 async def api_add_server(request: Request, req: AddServerRequest):
-    actor = _check_admin(request)
+    actor = _require_recent_admin_mfa(request)
+    if isinstance(actor, JSONResponse):
+        return actor
     # Enrolling a new SSH host is an administrator-only action. Keep the
     # isinstance guard because some callers/tests inject a truthy sentinel.
     if not actor or (isinstance(actor, dict) and actor.get('role') != 'admin'):
@@ -3746,8 +4312,9 @@ async def api_add_server(request: Request, req: AddServerRequest):
 @serialize_peer_lifecycle
 async def api_edit_server(request: Request, server_id: int, req: EditServerRequest,
                           server_uid: Optional[str] = None):
-    if not _check_admin(request):
-        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    actor = _require_recent_admin_mfa(request)
+    if isinstance(actor, JSONResponse):
+        return actor
     selected, error = _server_identity(server_id, server_uid)
     if error is not None:
         return error
@@ -8521,11 +9088,17 @@ def _backup_admin(request):
 
 @app.get('/api/settings/backup/download', tags=["Settings"])
 def api_backup_download(request: Request):
-    if not _backup_admin(request):
-        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    actor = _require_recent_admin_mfa(request)
+    if isinstance(actor, JSONResponse):
+        if actor.status_code == 403 and b'mfa_step_up_required' in actor.body:
+            return RedirectResponse('/security/step-up?return_to=%2Fsettings', status_code=303,
+                                    headers=PRIVATE_HEADERS)
+        actor.headers.update(PRIVATE_HEADERS)
+        return actor
     if not os.path.exists(DATA_FILE):
-        return JSONResponse({'error': 'Data file not found'}, status_code=404)
-    return FileResponse(DATA_FILE, media_type='application/json', filename='data.json')
+        return JSONResponse({'error': 'Data file not found'}, status_code=404, headers=PRIVATE_HEADERS)
+    return FileResponse(DATA_FILE, media_type='application/json', filename='data.json',
+                        headers=PRIVATE_HEADERS)
 
 
 class PrivateBackupResponse(StreamingResponse):
@@ -8549,6 +9122,10 @@ class PrivateBackupResponse(StreamingResponse):
 @app.post('/api/settings/backup/archive', tags=['Settings'])
 async def api_backup_archive(request: Request):
     # Unlike the legacy JSON endpoint, a complete archive is admin-only.
+    actor = _require_recent_admin_mfa(request)
+    if isinstance(actor, JSONResponse):
+        actor.headers.update(PRIVATE_HEADERS)
+        return actor
     if not _ssh_trust_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403, headers=PRIVATE_HEADERS)
     bearer = not get_current_user(request) and request.headers.get('authorization', '').lower().startswith('bearer ')
@@ -8587,9 +9164,13 @@ async def api_backup_archive(request: Request):
 @serialize_peer_lifecycle
 async def api_backup_restore(request: Request, file: UploadFile = File(...),
                              operation_id: Optional[str] = Form(None)):
+    actor = _require_recent_admin_mfa(request)
+    if isinstance(actor, JSONResponse):
+        actor.headers.update(PRIVATE_HEADERS)
+        return actor
     backup_actor = _backup_admin(request)
     if not backup_actor:
-        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+        return JSONResponse({'error': 'Forbidden'}, status_code=403, headers=PRIVATE_HEADERS)
     try:
         # Limit the in-memory JSON read; enforce request-body limits at the
         # reverse proxy too, since multipart parsing happens before this handler.

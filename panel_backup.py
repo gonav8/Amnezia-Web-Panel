@@ -326,6 +326,11 @@ def stage_restore(archive, destination, confirmation):
         data[DISASTER_HOLD] = operation
         RecoveryStore(data_file).commit(operation, 'offline:' + getpass.getuser(), 'archive_stage',
                                         digest({'archive_sha256': checksum}), before, data)
+        # Archives produced by pre-encryption releases and the new operation
+        # journal can contain base64 plaintext state. Seal all snapshots before
+        # publishing the restored tree; the external master key is required.
+        from secret_store import seal_legacy_recovery_snapshots
+        seal_legacy_recovery_snapshots(stage / 'state/data.json.recovery')
         from peer_recovery import atomic_json, _fsync_directory
         atomic_json(stage / 'RESTORE.json', {'archive_sha256': checksum, 'restore_id': operation,
                                             'counters_verified_final': False, 'startup_held': True})
